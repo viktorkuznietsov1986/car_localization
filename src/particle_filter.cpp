@@ -29,15 +29,13 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
 	if (!is_initialized) {
 
 		default_random_engine gen;
-		num_particles = 10; // will sort this out later
+		num_particles = 100;
 
 		normal_distribution<double> dist_x(x, std[0]);
 		normal_distribution<double> dist_y(y, std[1]);
 		normal_distribution<double> dist_theta(theta, std[2]);
 
 		for (int i = 0; i < num_particles; ++i) {
-			double sample_x, sample_y, sample_theta;
-
 			Particle particle;
 			particle.id = i;
 			particle.x = dist_x(gen);
@@ -60,7 +58,7 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
 	//  http://www.cplusplus.com/reference/random/default_random_engine/
 	default_random_engine gen;
 
-	bool use_linear_model = (fabs(yaw_rate) < epsilon);
+	bool use_linear_model = (fabs(yaw_rate) < epsilon); // use linear model if yaw_rate is close to zero
 
 	auto velocity_to_yaw = use_linear_model ? 1 : (velocity/yaw_rate);
 
@@ -92,7 +90,22 @@ void ParticleFilter::dataAssociation(std::vector<LandmarkObs> predicted, std::ve
 	//   observed measurement to this particular landmark.
 	// NOTE: this method will NOT be called by the grading code. But you will probably find it useful to
 	//   implement this method and use it as a helper during the updateWeights phase.
-	//for ()
+	for (auto& observation: observations) {
+		auto min_distance = INFINITY;
+		auto id = 0;
+
+		for (const auto& landmark: predicted) {
+			float distance = dist(observation.x, observation.y, landmark.x, landmark.y);
+
+			if (distance < min_distance) {
+				observation.id = landmark.id;
+				min_distance = distance;
+			}
+		}
+
+		//cout << "observation x = " << observation.x << "; observation y = " << observation.y << "; observation id = " << observation.id << endl;
+		//cout << "landmark x = " << predicted[observation.id-1].x << "; landmark y = " << predicted[observation.id-1].y << "; landmark id = " << predicted[observation.id-1].id << endl;
+	}
 }
 
 void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
@@ -115,52 +128,43 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 	double weights_sum = 0;
 
 	auto gauss_norm = 1.0/(2.0*M_PI*std_x*std_y);
-	cout << "normalizer = " << gauss_norm << endl;
 
+	// build the list of landmarks
+	std::vector<LandmarkObs> landmarks;
 
-	for (int i = 0; i < particles.size(); ++i) {
-		auto particle = particles[i];
-		particle.associations.clear();
+	for (const auto& landmark : map_landmarks.landmark_list) {
+		LandmarkObs landm;
+		landm.x = landmark.x_f;
+		landm.y = landmark.y_f;
+		landm.id = landmark.id_i;
+		landmarks.push_back(landm);
+	}
+
+	for (auto& particle : particles) {
+		// transform the observations to map coordinate system
+		std::vector<LandmarkObs> particle_obs;
+
 		for (const auto& observation: observations) {
+			LandmarkObs obs;
+			obs.x = particle.x + cos(particle.theta)*observation.x - sin(particle.theta)*observation.y;
+			obs.y = particle.y + sin(particle.theta)*observation.x + cos(particle.theta)*observation.y;
 
-			float xm = particle.x + cos(particle.theta)*observation.x - sin(particle.theta)*observation.y;
-			float ym = particle.y + sin(particle.theta)*observation.x + cos(particle.theta)*observation.y;
-
-			if (dist(particle.x, particle.y, xm, ym) > sensor_range) {
-				continue;
-			}
-
-			int idm = 0;
-			float min_distance = INFINITY;
-			// find the closest landmark
-			for (const auto& landmark: map_landmarks.landmark_list) {
-				float distance = dist(xm, ym, landmark.x_f, landmark.y_f);
-				if (distance < min_distance) {
-					idm = landmark.id_i;
-					min_distance = distance;
-				}
-			}
-
-			particle.associations.push_back(idm);
+			particle_obs.push_back(obs);
 		}
 
+		// do the data association
+		dataAssociation(landmarks, particle_obs);
+
+		// update weights
 		particle.weight = 1.0;
 
-		for (int j = 0; j < particle.associations.size(); ++j) {
-			auto observation = observations[j];
-			auto predicted = map_landmarks.landmark_list[particle.associations[j]];
-
-			float xm = particle.x + cos(particle.theta)*observation.x - sin(particle.theta)*observation.y;
-			float ym = particle.y + sin(particle.theta)*observation.x + cos(particle.theta)*observation.y;
-
-			auto exponent = (pow(xm-predicted.x_f, 2)/(2.0*pow(std_x, 2)) + pow(ym-predicted.y_f, 2)/(2.0*pow(std_y, 2)));
-			// ((x_obs - mu_x)**2)/(2 * sig_x**2) + ((y_obs - mu_y)**2)/(2 * sig_y**2
-
-			cout << "exponent = " << exponent << endl;
+		for (const auto& observation : particle_obs) {
+			auto landmark = landmarks[observation.id-1];
+			auto exponent = (pow(observation.x-landmark.x, 2)/(2.0*pow(std_x, 2)) + pow(observation.y-landmark.y, 2)/(2.0*pow(std_y, 2)));
+			//cout << "exponent = " << exponent << endl;
 
 			double p = gauss_norm*exp(-exponent);
-
-			cout << "p = " << p << endl;
+			//cout << "p = " << p << endl;
 
 			particle.weight *= p;
 		}
@@ -170,20 +174,27 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 		weights_sum += particle.weight;
 	}
 
-	cout << "before normalization = " << weights[0] << endl;
-
 	// normalize weights
 	for (auto& weight: weights) {
 		weight /= weights_sum;
 	}
-
-	cout << "after normalization = " << weights[0] << endl;
 }
 
 void ParticleFilter::resample() {
 	// TODO: Resample particles with replacement with probability proportional to their weight.
 	// NOTE: You may find std::discrete_distribution helpful here.
 	//   http://en.cppreference.com/w/cpp/numeric/random/discrete_distribution
+
+	/*
+	// for debugging purposes only
+	cout << "resample" << endl;
+	for (const auto& weight : weights) {
+		cout << weight << " ";
+	}
+
+	cout << endl;
+	*/
+
 	std::random_device rd;
   std::mt19937 gen(rd());
 
@@ -194,6 +205,9 @@ void ParticleFilter::resample() {
 	for (int i = 0; i < particles.size(); ++i) {
 		sampled_particles.push_back(particles[d(gen)]);
 	}
+
+	// update the particles collection based on the resampled particles
+	particles = sampled_particles;
 }
 
 Particle ParticleFilter::SetAssociations(Particle& particle, const std::vector<int>& associations,
